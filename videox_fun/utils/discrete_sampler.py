@@ -43,7 +43,6 @@ class DiscreteSampling:
                     (n_samples,), 
                     generator=generator, device=device,
                 )
-            print('proc[%d] idx=%s' % (self.rank, idx))
         else:   
             idx = torch.randint(
                     self.start_num_idx, self.start_num_idx + self.num_idx, (n_samples,), 

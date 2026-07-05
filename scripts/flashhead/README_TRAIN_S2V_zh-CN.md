@@ -16,6 +16,7 @@
 - [三、全参数训练](#三全参数训练)
   - [3.1 下载预训练模型](#31-下载预训练模型)
   - [3.2 快速开始（DeepSpeed-Zero-2）](#32-快速开始deepspeed-zero-2)
+  - [3.2.1 V2V 训练快速开始](#321-v2v-训练快速开始)
   - [3.3 常用训练参数](#33-常用训练参数)
   - [3.4 训练验证](#34-训练验证)
   - [3.5 使用 FSDP 训练](#35-使用-fsdp-训练)
@@ -147,8 +148,8 @@ modelscope download --dataset PAI/X-Fun-Videos-Audios-Demo --local_dir ./dataset
 如果你的数据使用的是相对路径，训练脚本中请这样配置：
 
 ```bash
-export DATASET_NAME="datasets/internal_datasets/"
-export DATASET_META_NAME="datasets/internal_datasets/metadata.json"
+export DATASET_NAME="datasets/my_dataset/"
+export DATASET_META_NAME="datasets/my_dataset/metadata.json"
 ```
 
 **绝对路径**：
@@ -231,6 +232,83 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
   --trainable_modules "."
 ```
 
+### 3.2.1 V2V 训练快速开始
+
+FlashHead V2V 训练在 S2V 训练基础上增加源视频条件，适合训练保持源视频身份、姿态和背景，同时由音频驱动口型的模型。数据格式仍然使用同一份 `metadata.json`，每条样本需要包含对应的视频和音频：
+
+```json
+[
+  {
+    "file_path": "train/video001.mp4",
+    "audio_path": "wav/audio001.wav",
+    "text": "A person talking with natural expressions",
+    "type": "video",
+    "width": 512,
+    "height": 512
+  }
+]
+```
+
+推荐直接使用封装脚本：
+
+```bash
+export MODEL_NAME="models/Diffusion_Transformer/SoulX-FlashHead-1_3B"
+export AUDIO_MODEL_NAME="models/Diffusion_Transformer/wav2vec2-base-960h"
+export DATASET_NAME="datasets/X-Fun-Videos-Audios-Demo"
+export DATASET_META_NAME="datasets/X-Fun-Videos-Audios-Demo/metadata_add_width_height.json"
+
+CUDA_VISIBLE_DEVICES=0,1 NUM_PROCESSES=2 ./scripts/flashhead/train_s2v_v2v.sh
+```
+
+也可以在命令行中直接调用：
+
+```bash
+accelerate launch --num_processes=2 --mixed_precision="bf16" scripts/flashhead/train_s2v_v2v.py \
+  --config_path="config/wan2.1/wan_civitai.yaml" \
+  --pretrained_model_name_or_path=$MODEL_NAME \
+  --audio_encoder_path=$AUDIO_MODEL_NAME \
+  --train_data_dir=$DATASET_NAME \
+  --train_data_meta=$DATASET_META_NAME \
+  --video_sample_size=512 \
+  --token_sample_size=512 \
+  --fix_sample_size 512 512 \
+  --video_sample_stride=1 \
+  --video_sample_n_frames=41 \
+  --train_batch_size=1 \
+  --gradient_accumulation_steps=1 \
+  --dataloader_num_workers=8 \
+  --num_train_epochs=100 \
+  --checkpointing_steps=1000 \
+  --learning_rate=2e-05 \
+  --lr_scheduler="constant_with_warmup" \
+  --lr_warmup_steps=100 \
+  --output_dir="output_dir_flashhead_v2v" \
+  --gradient_checkpointing \
+  --mixed_precision="bf16" \
+  --adam_weight_decay=3e-2 \
+  --adam_epsilon=1e-10 \
+  --vae_mini_batch=1 \
+  --max_grad_norm=0.05 \
+  --enable_bucket \
+  --uniform_sampling \
+  --low_vram \
+  --trainable_modules "." \
+  --v2v_prob=0.8 \
+  --keep_heads_max=2 \
+  --spatial_margin_max=2 \
+  --audio_dropout_prob=0.15
+```
+
+V2V 训练脚本会为每个视频片段采样额外参考帧，构造源视频条件 `y`，并只在需要学习的时间和空间区域注入噪声。`--v2v_prob` 控制 V2V 样本比例，其余样本回退为 S2V 条件，可帮助模型保留原始 S2V 能力。
+
+支持用逗号传入多个数据集：
+
+```bash
+export DATASET_NAME="datasets/set_a,datasets/set_b"
+export DATASET_META_NAME="datasets/set_a/metadata.json,datasets/set_b/metadata.json"
+./scripts/flashhead/train_s2v_v2v.sh
+```
+
 ### 3.3 常用训练参数
 
 **核心参数说明**：
@@ -240,8 +318,8 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
 | `--config_path` | 模型配置文件路径 | `config/wan2.1/wan_civitai.yaml` |
 | `--pretrained_model_name_or_path` | 预训练模型路径 | `models/Diffusion_Transformer/SoulX-FlashHead-1_3B` |
 | `--audio_encoder_path` | 音频编码器路径（**FlashHead-S2V 特有**） | `models/Diffusion_Transformer/wav2vec2-base-960h` |
-| `--train_data_dir` | 训练数据目录 | `datasets/internal_datasets/` |
-| `--train_data_meta` | 训练数据元数据文件 | `datasets/internal_datasets/metadata.json` |
+| `--train_data_dir` | 训练数据目录 | `datasets/my_dataset/` |
+| `--train_data_meta` | 训练数据元数据文件 | `datasets/my_dataset/metadata.json` |
 | `--train_batch_size` | 每批训练的样本数 | 1 |
 | `--video_sample_size` | 视频最大训练分辨率 | 512 |
 | `--token_sample_size` | Token 长度采样大小 | 512 |
@@ -308,8 +386,8 @@ accelerate launch --use_deepspeed --deepspeed_config_file config/zero_stage2_con
 ```bash
 export MODEL_NAME="models/Diffusion_Transformer/SoulX-FlashHead-1_3B"
 export AUDIO_MODEL_NAME="models/Diffusion_Transformer/wav2vec2-base-960h"
-export DATASET_NAME="datasets/internal_datasets/"
-export DATASET_META_NAME="datasets/internal_datasets/metadata.json"
+export DATASET_NAME="datasets/my_dataset/"
+export DATASET_META_NAME="datasets/my_dataset/metadata.json"
 # NCCL_IB_DISABLE=1 和 NCCL_P2P_DISABLE=1 用于无 RDMA 的多机环境
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1
@@ -356,8 +434,8 @@ accelerate launch --mixed_precision="bf16" --use_fsdp --fsdp_auto_wrap_policy TR
 ```bash
 export MODEL_NAME="models/Diffusion_Transformer/SoulX-FlashHead-1_3B"
 export AUDIO_MODEL_NAME="models/Diffusion_Transformer/wav2vec2-base-960h"
-export DATASET_NAME="datasets/internal_datasets/"
-export DATASET_META_NAME="datasets/internal_datasets/metadata.json"
+export DATASET_NAME="datasets/my_dataset/"
+export DATASET_META_NAME="datasets/my_dataset/metadata.json"
 # NCCL_IB_DISABLE=1 和 NCCL_P2P_DISABLE=1 用于无 RDMA 的多机环境
 # export NCCL_IB_DISABLE=1
 # export NCCL_P2P_DISABLE=1

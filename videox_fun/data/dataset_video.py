@@ -239,14 +239,31 @@ class VideoSpeechDataset(Dataset):
         enable_motion_info=False,
         motion_frames=73,
         return_file_name=False,
+        skip_resize=False,
     ):
-        # Loading annotations from files
-        print(f"loading annotations from {ann_path} ...")
-        self.dataset = json.load(open(ann_path, 'r'))
-        self.length = len(self.dataset)
-        print(f"data scale: {self.length}")
+        # Support comma-separated paths for multi-dataset training
+        ann_paths = [p.strip() for p in ann_path.split(',')]
+        data_roots = [r.strip() for r in data_root.split(',')] if data_root else [None] * len(ann_paths)
+        if len(data_roots) == 1 and len(ann_paths) > 1:
+            data_roots = data_roots * len(ann_paths)
+        assert len(ann_paths) == len(data_roots), \
+            f"ann_path and data_root must have same number of entries, got {len(ann_paths)} vs {len(data_roots)}"
 
-        self.data_root = data_root
+        # Load and merge all datasets, storing per-item data_root
+        self.dataset = []
+        self.item_data_root = []
+        for ap, dr in zip(ann_paths, data_roots):
+            print(f"loading annotations from {ap} (data_root={dr}) ...")
+            items = json.load(open(ap, 'r'))
+            print(f"  loaded {len(items)} items")
+            self.dataset.extend(items)
+            self.item_data_root.extend([dr] * len(items))
+
+        self.length = len(self.dataset)
+        print(f"total data scale: {self.length}")
+
+        # Keep global data_root for backward compatibility (single-dataset case)
+        self.data_root = data_roots[0] if len(data_roots) == 1 else None
         self.enable_bucket = enable_bucket
         self.enable_inpaint = enable_inpaint
         self.inpaint_mask_fill_value = inpaint_mask_fill_value
@@ -255,6 +272,7 @@ class VideoSpeechDataset(Dataset):
         self.enable_motion_info = enable_motion_info
         self.motion_frames = motion_frames
         self.return_file_name = return_file_name
+        self.skip_resize = skip_resize
         
         # Video params: resize, center crop, normalize to [-1, 1]
         self.video_sample_stride = video_sample_stride
@@ -274,13 +292,14 @@ class VideoSpeechDataset(Dataset):
         video_id, text = video_dict['file_path'], video_dict['text']
         audio_id = video_dict['audio_path']
 
-        # Resolve video and audio paths
-        if self.data_root is None:
+        # Resolve video and audio paths using per-item data_root
+        item_root = self.item_data_root[idx] if hasattr(self, 'item_data_root') else self.data_root
+        if item_root is None:
             video_path = video_id
             audio_path = audio_id
         else:
-            video_path = os.path.join(self.data_root, video_id)
-            audio_path = os.path.join(self.data_root, audio_id)
+            video_path = os.path.join(item_root, video_id)
+            audio_path = os.path.join(item_root, audio_id)
 
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found for {video_path}")
@@ -313,17 +332,86 @@ class VideoSpeechDataset(Dataset):
                 raw_frames = func_timeout(
                     VIDEO_READER_TIMEOUT, get_video_reader_batch, args=sample_args
                 )
-                # Resize each frame and free the original array early to reduce peak memory
-                resized_frames = []
-                for i in range(len(raw_frames)):
-                    resized_frames.append(resize_frame(raw_frames[i], max(self.video_sample_size)))
-                del raw_frames
-                pixel_values = np.array(resized_frames)
-                del resized_frames
+                if self.skip_resize:
+                    pixel_values = np.array(raw_frames)
+                    del raw_frames
+                else:
+                    # Resize each frame and free the original array early to reduce peak memory
+                    resized_frames = []
+                    for i in range(len(raw_frames)):
+                        resized_frames.append(resize_frame(raw_frames[i], max(self.video_sample_size)))
+                    del raw_frames
+                    pixel_values = np.array(resized_frames)
+                    del resized_frames
             except FunctionTimedOut:
                 raise ValueError(f"Read {idx} timeout.")
             except Exception as e:
                 raise ValueError(f"Failed to extract frames from video. Error is {e}.")
+
+            # Sample 3 or 5 reference frames around the current clip.
+            # Single clips use in-clip frames only; boundary clips borrow frames from
+            # the available side; middle clips use both before and after context.
+            margin = 32
+            n_ref_max = 5
+            clip_start = start_frame
+            clip_end = start_frame + (actual_n_frames - 1) * local_video_sample_stride
+
+            before_lo = max(0, clip_start - margin)
+            before_hi = clip_start - 1
+            after_lo = clip_end + 1
+            after_hi = min(total_frames - 1, clip_end + margin)
+
+            has_before = before_hi >= before_lo
+            has_after = after_hi >= after_lo
+
+            def _sample_k(lo, hi, k):
+                if hi < lo:
+                    p = max(0, min(total_frames - 1, lo))
+                    return [p] * k
+                pool = list(range(lo, hi + 1))
+                if len(pool) >= k:
+                    return random.sample(pool, k)
+                if len(pool) == 1:
+                    return [pool[0]] * k
+                return [random.choice(pool) for _ in range(k)]
+
+            if has_before and has_after:
+                ref_picks = (_sample_k(before_lo, before_hi, 2)
+                             + _sample_k(clip_start, clip_end, 1)
+                             + _sample_k(after_lo, after_hi, 2))
+                n_ref = 5
+            elif has_after:
+                ref_picks = (_sample_k(clip_start, clip_end, 2)
+                             + _sample_k(after_lo, after_hi, 3))
+                n_ref = 5
+            elif has_before:
+                ref_picks = (_sample_k(before_lo, before_hi, 3)
+                             + _sample_k(clip_start, clip_end, 2))
+                n_ref = 5
+            else:
+                ref_picks = _sample_k(clip_start, clip_end, 3)
+                n_ref = 3
+
+            # Pad to n_ref_max with the first valid pick so collate stacks succeed.
+            extra_ref_ids = list(ref_picks)
+            while len(extra_ref_ids) < n_ref_max:
+                extra_ref_ids.append(extra_ref_ids[0])
+
+            try:
+                extra_raw = func_timeout(
+                    VIDEO_READER_TIMEOUT, get_video_reader_batch,
+                    args=(video_reader, extra_ref_ids),
+                )
+                if self.skip_resize:
+                    extra_ref_frames = np.array(extra_raw)
+                else:
+                    extra_ref_frames = np.array([
+                        resize_frame(f, max(self.video_sample_size)) for f in extra_raw
+                    ])
+                del extra_raw
+            except Exception:
+                fallback_ids = [random.randint(0, len(pixel_values) - 1) for _ in range(n_ref_max)]
+                extra_ref_frames = pixel_values[fallback_ids].copy()
 
             # Motion video processing
             _, height, width, channel = np.shape(pixel_values)
@@ -342,14 +430,19 @@ class VideoSpeechDataset(Dataset):
                     motion_raw_frames = func_timeout(
                         VIDEO_READER_TIMEOUT, get_video_reader_batch, args=_motion_sample_args
                     )
-                    # Resize each frame and free the original array early
-                    motion_resized_frames = []
-                    for i in range(len(motion_raw_frames)):
-                        motion_resized_frames.append(resize_frame(motion_raw_frames[i], max(self.video_sample_size)))
-                    del motion_raw_frames
-                    if len(motion_resized_frames) > 0:
-                        motion_pixel_values[-len(motion_resized_frames):] = motion_resized_frames
-                    del motion_resized_frames
+                    if self.skip_resize:
+                        if len(motion_raw_frames) > 0:
+                            motion_pixel_values[-len(motion_raw_frames):] = motion_raw_frames
+                        del motion_raw_frames
+                    else:
+                        # Resize each frame and free the original array early
+                        motion_resized_frames = []
+                        for i in range(len(motion_raw_frames)):
+                            motion_resized_frames.append(resize_frame(motion_raw_frames[i], max(self.video_sample_size)))
+                        del motion_raw_frames
+                        if len(motion_resized_frames) > 0:
+                            motion_pixel_values[-len(motion_resized_frames):] = motion_resized_frames
+                        del motion_resized_frames
 
                 if not self.enable_bucket:
                     motion_pixel_values = torch.from_numpy(motion_pixel_values).permute(0, 3, 1, 2).contiguous()
@@ -363,6 +456,10 @@ class VideoSpeechDataset(Dataset):
                 pixel_values = torch.from_numpy(pixel_values).permute(0, 3, 1, 2).contiguous()
                 pixel_values = pixel_values / 255.
                 pixel_values = self.pixel_transforms(pixel_values)
+
+                extra_ref_frames = torch.from_numpy(extra_ref_frames).permute(0, 3, 1, 2).contiguous()
+                extra_ref_frames = extra_ref_frames / 255.
+                extra_ref_frames = self.pixel_transforms(extra_ref_frames)
 
         # Load and extract the corresponding audio segment
         # Calculate start and end times (in seconds) of the video clip
@@ -390,7 +487,7 @@ class VideoSpeechDataset(Dataset):
         if random.random() < self.text_drop_ratio:
             text = ''
 
-        return pixel_values, motion_pixel_values, text, audio_segment, sample_rate, new_fps
+        return pixel_values, motion_pixel_values, text, audio_segment, sample_rate, new_fps, extra_ref_frames, n_ref
 
     def __len__(self):
         return self.length
@@ -401,7 +498,7 @@ class VideoSpeechDataset(Dataset):
         while True:
             sample = {}
             try:
-                pixel_values, motion_pixel_values, text, audio, sample_rate, fps = self.get_batch(idx)
+                pixel_values, motion_pixel_values, text, audio, sample_rate, fps, extra_ref_frames, n_ref = self.get_batch(idx)
                 sample["pixel_values"] = pixel_values
                 sample["motion_pixel_values"] = motion_pixel_values
                 sample["text"] = text
@@ -409,6 +506,8 @@ class VideoSpeechDataset(Dataset):
                 sample["sample_rate"] = sample_rate
                 sample["fps"] = fps
                 sample["idx"] = idx
+                sample["extra_ref_frames"] = extra_ref_frames
+                sample["n_ref"] = n_ref
                 
                 if self.return_file_name:
                     sample["file_name"] = os.path.basename(data_info['file_path'])

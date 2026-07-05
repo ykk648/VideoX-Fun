@@ -13,6 +13,21 @@ from transformers import Wav2Vec2Config, Wav2Vec2FeatureExtractor
 from transformers import Wav2Vec2Model as TransformersWav2Vec2Model
 from transformers.modeling_outputs import BaseModelOutput
 
+import pyloudnorm as _pyln
+
+
+def _loudness_norm(audio_array, sr=16000, lufs=-23):
+    """Normalize speech loudness to a target LUFS value.
+
+    Skips normalization when integrated_loudness is undefined (|loudness| > 100,
+    typically silence) to avoid numerical blowups; otherwise normalizes.
+    """
+    meter = _pyln.Meter(sr)
+    loudness = meter.integrated_loudness(audio_array)
+    if abs(loudness) > 100:
+        return audio_array
+    return _pyln.normalize.loudness(audio_array, loudness, lufs)
+
 
 def linear_interpolation(features, seq_len):
     """Linear interpolation for audio features."""
@@ -128,6 +143,9 @@ class FlashHeadAudioEncoder(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         """
         # Load audio
         audio_input, sample_rate = librosa.load(audio_path, sr=sr)
+
+        # Normalize loudness before feeding audio to wav2vec.
+        audio_input = _loudness_norm(audio_input, sr=sample_rate)
         
         # Calculate video_length if not provided
         if video_length is None:
@@ -179,6 +197,9 @@ class FlashHeadAudioEncoder(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         # Convert to numpy if tensor
         if isinstance(audio_array, torch.Tensor):
             audio_array = audio_array.cpu().numpy()
+
+        # Normalize loudness before feeding audio to wav2vec.
+        audio_array = _loudness_norm(audio_array, sr=sample_rate)
         
         # Extract features
         input_values = self.feature_extractor(
