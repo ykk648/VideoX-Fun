@@ -5,6 +5,7 @@ timm
 tomesd
 librosa
 pyloudnorm
+soundfile
 torch>=2.1.2
 torchdiffeq
 torchsde
